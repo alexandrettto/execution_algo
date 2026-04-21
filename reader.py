@@ -14,6 +14,10 @@ from collections import defaultdict
 import gc
 import re
 
+import zipfile
+import gzip
+import io
+
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
@@ -266,27 +270,61 @@ def normalize_chunk(df: pd.DataFrame) -> pd.DataFrame:
 
     return out
 
+def build_output_name(zip_path: Path, inner_member: str) -> str:
+    """
+    Пример:
+    202601.zip + 20260105/ordlog.exp.gz
+    ->
+    202601_20260105_CNYRUB_TOM_top5.parquet
+    """
+    zip_stem = safe_stem(zip_path)
+    day_part = Path(inner_member).parts[0] if len(Path(inner_member).parts) > 1 else Path(inner_member).stem
+    day_part = safe_stem(Path(day_part))
+    return f"{zip_stem}_{day_part}_CNYRUB_TOM_top5.parquet"
 
-def count_lines(path: Path) -> int:
+def read_gz_csv_chunks_from_zip(zip_path: Path, inner_member: str, chunksize: int):
+    with zipfile.ZipFile(zip_path) as zf:
+        with zf.open(inner_member) as gz_file:
+            with gzip.open(gz_file, "rt", encoding=CSV_ENCODING or "utf-8", newline="") as f:
+                reader = pd.read_csv(
+                    f,
+                    chunksize=chunksize,
+                    sep=CSV_SEPARATOR,
+                    low_memory=False,
+                )
+                for chunk in reader:
+                    yield chunk
+
+def count_lines_in_gz_inside_zip(zip_path: Path, inner_member: str) -> int:
     n = 0
-    with open(path, "rb") as f:
-        for _ in f:
-            n += 1
+    with zipfile.ZipFile(zip_path) as zf:
+        with zf.open(inner_member) as gz_file:
+            with gzip.open(gz_file, "rt", encoding=CSV_ENCODING or "utf-8", newline="") as f:
+                for _ in f:
+                    n += 1
     return max(n - 1, 0)  # minus header
 
-
-def find_input_files():
+def find_month_zip_files():
     files = sorted(
         f for f in INPUT_DIR.rglob("*")
         if f.is_file()
-        and FILE_PATTERN.lower() in f.name.lower()
-        and f.suffix.lower() in [".csv", ".txt"]
+        and f.suffix.lower() == ".zip"
     )
     if not files:
-        raise FileNotFoundError(
-            f"No CSV/TXT files found in {INPUT_DIR} with pattern '{FILE_PATTERN}'"
-        )
+        raise FileNotFoundError(f"No .zip files found in {INPUT_DIR}")
     return files
+
+
+def iter_ordlog_members(zip_path: Path):
+    """
+    Ищет внутри monthly zip файлы вида .../ordlog.exp.gz
+    """
+    with zipfile.ZipFile(zip_path) as zf:
+        members = sorted(
+            name for name in zf.namelist()
+            if name.lower().endswith("ordlog.exp.gz")
+        )
+    return members
 
 
 def build_rows_from_chunk(chunk: pd.DataFrame, ob: OrderBookReconstructor, prev_l1):
@@ -354,33 +392,28 @@ def build_rows_from_chunk(chunk: pd.DataFrame, ob: OrderBookReconstructor, prev_
 # MAIN
 # ============================================================
 
-def process_one_file(file_path: Path):
-    print(f"\nProcessing: {file_path.name}")
+def process_one_ordlog_member(zip_path: Path, inner_member: str):
+    print(f"\nProcessing: {zip_path.name} :: {inner_member}")
 
-    output_name = safe_stem(file_path) + "_CNYRUB_TOM_top5.parquet"
+    output_name = build_output_name(zip_path, inner_member)
     output_path = OUTPUT_DIR / output_name
 
     ob = OrderBookReconstructor()
     prev_l1 = None
     writer = None
 
-    total_rows = count_lines(file_path)
-
-    reader = pd.read_csv(
-        file_path,
-        chunksize=CHUNKSIZE,
-        sep=CSV_SEPARATOR,
-        encoding=CSV_ENCODING,
-        low_memory=False,
-    )
-
-    pbar = tqdm(total=total_rows, desc=file_path.name, unit="rows")
+    total_rows = count_lines_in_gz_inside_zip(zip_path, inner_member)
+    pbar = tqdm(total=total_rows, desc=f"{zip_path.name}:{inner_member}", unit="rows")
 
     saved_rows = 0
     cny_rows = 0
 
     try:
-        for raw_chunk in reader:
+        for raw_chunk in read_gz_csv_chunks_from_zip(
+            zip_path=zip_path,
+            inner_member=inner_member,
+            chunksize=CHUNKSIZE,
+        ):
             pbar.update(len(raw_chunk))
 
             chunk = normalize_chunk(raw_chunk)
@@ -424,17 +457,23 @@ def process_one_file(file_path: Path):
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    files = find_input_files()
+    zip_files = find_month_zip_files()
 
-    print("Found files:")
-    for f in files:
-        print(" ", f)
+    print("Found monthly zip files:")
+    for z in zip_files:
+        print(" ", z)
 
-    for f in files:
-        process_one_file(f)
+    for zip_path in zip_files:
+        members = iter_ordlog_members(zip_path)
+
+        if not members:
+            print(f"[WARN] No ordlog.exp.gz inside {zip_path.name}")
+            continue
+
+        for inner_member in members:
+            process_one_ordlog_member(zip_path, inner_member)
 
     print("\nDone.")
-
-
+    
 if __name__ == "__main__":
     main()
