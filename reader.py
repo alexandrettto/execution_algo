@@ -37,9 +37,7 @@ except ImportError as e:
 
 INPUT_DIR = Path(r"C:\Users\ИллюкАА\Documents\algotrading")        # папка с OrderLog файлами
 OUTPUT_DIR = Path(r"C:\Users\ИллюкАА\Documents\algotrading\CNY_BOOK_TOP5")  # куда сохранять результат
-
-
-FILE_PATTERN = "OrderLog"
+FILE_PATTERN = "ordlog"
 
 CSV_SEPARATOR = ","
 CSV_ENCODING = None
@@ -295,23 +293,47 @@ def read_gz_csv_chunks_from_zip(zip_path: Path, inner_member: str, chunksize: in
                 for chunk in reader:
                     yield chunk
 
-def count_lines_in_gz_inside_zip(zip_path: Path, inner_member: str) -> int:
+def count_lines(path: Path) -> int:
     n = 0
-    with zipfile.ZipFile(zip_path) as zf:
-        with zf.open(inner_member) as gz_file:
-            with gzip.open(gz_file, "rt", encoding=CSV_ENCODING or "utf-8", newline="") as f:
-                for _ in f:
-                    n += 1
+
+    if path.suffix.lower() == ".gz":
+        with gzip.open(path, "rt", encoding=CSV_ENCODING or "utf-8", newline="") as f:
+            for _ in f:
+                n += 1
+    else:
+        with open(path, "r", encoding=CSV_ENCODING or "utf-8", newline="") as f:
+            for _ in f:
+                n += 1
+
     return max(n - 1, 0)  # minus header
 
-def find_month_zip_files():
-    files = sorted(
-        f for f in INPUT_DIR.rglob("*")
-        if f.is_file()
-        and f.suffix.lower() == ".zip"
+def find_input_files():
+    month_dirs = sorted(
+        d for d in INPUT_DIR.iterdir()
+        if d.is_dir() and d.name.isdigit() and len(d.name) == 6
     )
+
+    if not month_dirs:
+        raise FileNotFoundError(
+            f"No month directories like 202601, 202602 found in {INPUT_DIR}"
+        )
+
+    files = []
+
+    for month_dir in month_dirs:
+        month_files = sorted(
+            f for f in month_dir.rglob("*")
+            if f.is_file()
+            and FILE_PATTERN.lower() in f.name.lower()
+            and f.suffix.lower() in [".csv", ".txt", ".gz"]
+        )
+        files.extend(month_files)
+
     if not files:
-        raise FileNotFoundError(f"No .zip files found in {INPUT_DIR}")
+        raise FileNotFoundError(
+            f"No files found under month folders in {INPUT_DIR} with pattern '{FILE_PATTERN}'"
+        )
+
     return files
 
 
@@ -391,29 +413,37 @@ def build_rows_from_chunk(chunk: pd.DataFrame, ob: OrderBookReconstructor, prev_
 # ============================================================
 # MAIN
 # ============================================================
+def process_one_file(file_path: Path):
+    print(f"\nProcessing: {file_path}")
 
-def process_one_ordlog_member(zip_path: Path, inner_member: str):
-    print(f"\nProcessing: {zip_path.name} :: {inner_member}")
-
-    output_name = build_output_name(zip_path, inner_member)
+    output_name = safe_stem(file_path) + "_CNYRUB_TOM_top5.parquet"
     output_path = OUTPUT_DIR / output_name
 
     ob = OrderBookReconstructor()
     prev_l1 = None
     writer = None
 
-    total_rows = count_lines_in_gz_inside_zip(zip_path, inner_member)
-    pbar = tqdm(total=total_rows, desc=f"{zip_path.name}:{inner_member}", unit="rows")
+    total_rows = count_lines(file_path)
+
+    read_csv_kwargs = dict(
+        chunksize=CHUNKSIZE,
+        sep=CSV_SEPARATOR,
+        encoding=CSV_ENCODING,
+        low_memory=False,
+    )
+
+    if file_path.suffix.lower() == ".gz":
+        read_csv_kwargs["compression"] = "gzip"
+
+    reader = pd.read_csv(file_path, **read_csv_kwargs)
+
+    pbar = tqdm(total=total_rows, desc=file_path.name, unit="rows")
 
     saved_rows = 0
     cny_rows = 0
 
     try:
-        for raw_chunk in read_gz_csv_chunks_from_zip(
-            zip_path=zip_path,
-            inner_member=inner_member,
-            chunksize=CHUNKSIZE,
-        ):
+        for raw_chunk in reader:
             pbar.update(len(raw_chunk))
 
             chunk = normalize_chunk(raw_chunk)
@@ -453,27 +483,20 @@ def process_one_ordlog_member(zip_path: Path, inner_member: str):
     print(f"CNY rows processed: {cny_rows:,}")
     print(f"Output: {output_path}")
 
-
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    zip_files = find_month_zip_files()
+    files = find_input_files()
 
-    print("Found monthly zip files:")
-    for z in zip_files:
-        print(" ", z)
+    print("Found files:")
+    for f in files:
+        print(" ", f)
 
-    for zip_path in zip_files:
-        members = iter_ordlog_members(zip_path)
-
-        if not members:
-            print(f"[WARN] No ordlog.exp.gz inside {zip_path.name}")
-            continue
-
-        for inner_member in members:
-            process_one_ordlog_member(zip_path, inner_member)
+    for f in files:
+        process_one_file(f)
 
     print("\nDone.")
-    
+
+
 if __name__ == "__main__":
     main()
